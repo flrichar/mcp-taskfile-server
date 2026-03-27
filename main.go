@@ -1,10 +1,13 @@
+// Package main implements an MCP server that exposes Taskfile tasks as tools.
 package main
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"strings"
 
@@ -13,14 +16,14 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// TaskfileServer represents our MCP server for Taskfile.yml
+// TaskfileServer represents our MCP server for Taskfile.yml.
 type TaskfileServer struct {
 	executor *task.Executor
 	taskfile *ast.Taskfile
 	workdir  string
 }
 
-// NewTaskfileServer creates a new Taskfile MCP server
+// NewTaskfileServer creates a new Taskfile MCP server.
 func NewTaskfileServer() (*TaskfileServer, error) {
 	workdir, err := os.Getwd()
 	if err != nil {
@@ -45,7 +48,7 @@ func NewTaskfileServer() (*TaskfileServer, error) {
 	}, nil
 }
 
-// createTaskHandler creates a handler function for a specific task
+// createTaskHandler creates a handler function for a specific task.
 func (s *TaskfileServer) createTaskHandler(taskName string) mcp.ToolHandler {
 	return func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		// Extract variables from request arguments
@@ -93,7 +96,7 @@ func (s *TaskfileServer) createTaskHandler(taskName string) mcp.ToolHandler {
 		}
 
 		// Execute the task
-		err := executor.Run(ctx, call)
+		taskErr := executor.Run(ctx, call)
 
 		// Collect output
 		stdoutStr := stdout.String()
@@ -102,38 +105,32 @@ func (s *TaskfileServer) createTaskHandler(taskName string) mcp.ToolHandler {
 		// Build result message
 		var result strings.Builder
 
-		if err != nil {
-			result.WriteString(fmt.Sprintf("Task '%s' failed with error: %v\n", taskName, err))
+		if taskErr != nil {
+			fmt.Fprintf(&result, "Task '%s' failed with error: %v\n", taskName, taskErr)
 		} else {
-			result.WriteString(fmt.Sprintf("Task '%s' completed successfully.\n", taskName))
+			fmt.Fprintf(&result, "Task '%s' completed successfully.\n", taskName)
 		}
 
 		if stdoutStr != "" {
-			result.WriteString(fmt.Sprintf("\nOutput:\n%s", stdoutStr))
+			result.WriteString("\nOutput:\n" + stdoutStr)
 		}
 
 		if stderrStr != "" {
-			result.WriteString(fmt.Sprintf("\nErrors:\n%s", stderrStr))
-		}
-
-		if err != nil {
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: result.String()}},
-				IsError: true,
-			}, nil
+			result.WriteString("\nErrors:\n" + stderrStr)
 		}
 
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: result.String()}},
+			IsError: taskErr != nil,
 		}, nil
 	}
 }
 
-// createToolForTask creates an MCP tool definition for a given task
+// createToolForTask creates an MCP tool definition for a given task.
 func (s *TaskfileServer) createToolForTask(taskName string, taskDef *ast.Task) *mcp.Tool {
 	description := taskDef.Desc
 	if description == "" {
-		description = fmt.Sprintf("Execute task: %s", taskName)
+		description = "Execute task: " + taskName
 	}
 
 	// Collect all variables (global + task-specific)
@@ -141,16 +138,12 @@ func (s *TaskfileServer) createToolForTask(taskName string, taskDef *ast.Task) *
 
 	// Add global variables first
 	if s.taskfile.Vars != nil && s.taskfile.Vars.Len() > 0 {
-		for varName, varDef := range s.taskfile.Vars.All() {
-			allVars[varName] = varDef
-		}
+		maps.Insert(allVars, s.taskfile.Vars.All())
 	}
 
 	// Add task-specific variables (these override global ones)
 	if taskDef.Vars != nil && taskDef.Vars.Len() > 0 {
-		for varName, varDef := range taskDef.Vars.All() {
-			allVars[varName] = varDef
-		}
+		maps.Insert(allVars, taskDef.Vars.All())
 	}
 
 	// Build JSON Schema properties for all variables
@@ -166,10 +159,13 @@ func (s *TaskfileServer) createToolForTask(taskName string, taskDef *ast.Task) *
 		}
 	}
 
-	schema, _ := json.Marshal(map[string]any{
+	schema, err := json.Marshal(map[string]any{
 		"type":       "object",
 		"properties": properties,
 	})
+	if err != nil {
+		schema = []byte(`{"type":"object"}`)
+	}
 
 	return &mcp.Tool{
 		Name:        taskName,
@@ -178,10 +174,10 @@ func (s *TaskfileServer) createToolForTask(taskName string, taskDef *ast.Task) *
 	}
 }
 
-// registerTasks discovers all tasks and registers them as MCP tools
+// registerTasks discovers all tasks and registers them as MCP tools.
 func (s *TaskfileServer) registerTasks(mcpServer *mcp.Server) error {
 	if s.taskfile.Tasks == nil {
-		return fmt.Errorf("no tasks found in Taskfile")
+		return errors.New("no tasks found in Taskfile")
 	}
 
 	// Iterate through all tasks and register them

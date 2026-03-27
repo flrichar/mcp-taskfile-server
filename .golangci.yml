@@ -9,35 +9,35 @@ linters:
     - copyloopvar
     - durationcheck
     - errcheck
-    #- errchkjson
+    - errchkjson
     - errname
     - errorlint
     - exptostd
     - fatcontext
     - gocheckcompilerdirectives
     - gocritic
-    #- godot
+    - godot
     - govet
     - ineffassign
     - intrange
     - mirror
     - misspell
-    #- modernize
+    - modernize
     - nakedret
-    #- nilerr
+    - nilerr
     - nilnesserr
     - nilnil
     - noctx
     - nolintlint
     - nosprintfhostport
-    #- perfsprint
+    - perfsprint
     - predeclared
     - reassign
     - recvcheck
-    #- revive
+    - revive
     - rowserrcheck
     - sqlclosecheck
-    #- staticcheck
+    - staticcheck
     - thelper
     - unconvert
     - unparam
@@ -48,14 +48,6 @@ linters:
     - wastedassign
     - gosec
     - wrapcheck
-  disable:
-    - errchkjson
-    - godot
-    - modernize
-    - nilerr
-    - perfsprint
-    - revive
-    - staticcheck
   settings:
     errorlint:
       errorf: true
