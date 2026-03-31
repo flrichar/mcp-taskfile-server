@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"maps"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -35,13 +36,13 @@ func loadServerFromFixture(t *testing.T, name string) *TaskfileServer {
 	}
 }
 
-// fakeRegistrar records tools registered via AddTool.
-type fakeRegistrar struct {
-	tools []mcp.Tool
-}
-
-func (f *fakeRegistrar) AddTool(t *mcp.Tool, _ mcp.ToolHandler) {
-	f.tools = append(f.tools, *t)
+// newTestServer creates a TaskfileServer from a fixture with a real *mcp.Server attached.
+func newTestServer(t *testing.T, fixture string) *TaskfileServer {
+	t.Helper()
+	s := loadServerFromFixture(t, fixture)
+	s.mcpServer = mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0.0.0"}, nil)
+	s.registeredTools = make(map[string]mcp.Tool)
+	return s
 }
 
 // schemaProperties marshals a tool's InputSchema to JSON, then unmarshals it
@@ -158,19 +159,34 @@ func TestCreateToolForTask_OverrideVars(t *testing.T) {
 	}
 }
 
-func TestRegisterTasks_SkipsInternal(t *testing.T) {
+func TestBuildToolSet_SkipsInternal(t *testing.T) {
 	s := loadServerFromFixture(t, "internal")
 
-	reg := &fakeRegistrar{}
-	if err := s.registerTasks(reg); err != nil {
-		t.Fatalf("registerTasks failed: %v", err)
+	tools, _, err := s.buildToolSet()
+	if err != nil {
+		t.Fatalf("buildToolSet failed: %v", err)
 	}
 
-	if len(reg.tools) != 1 {
-		t.Fatalf("expected 1 registered tool, got %d", len(reg.tools))
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 tool, got %d", len(tools))
 	}
-	if reg.tools[0].Name != "public" {
-		t.Errorf("registered tool name = %q, want %q", reg.tools[0].Name, "public")
+	if _, ok := tools["public"]; !ok {
+		t.Errorf("expected tool %q, got tools: %v", "public", toolNames(tools))
+	}
+}
+
+func TestSyncTools_SkipsInternal(t *testing.T) {
+	s := newTestServer(t, "internal")
+
+	if err := s.syncTools(); err != nil {
+		t.Fatalf("syncTools failed: %v", err)
+	}
+
+	if len(s.registeredTools) != 1 {
+		t.Fatalf("expected 1 registered tool, got %d", len(s.registeredTools))
+	}
+	if _, ok := s.registeredTools["public"]; !ok {
+		t.Errorf("expected tool %q, got tools: %v", "public", toolNames(s.registeredTools))
 	}
 }
 
@@ -284,62 +300,120 @@ func TestCreateToolForTask_LeadingDot(t *testing.T) {
 	}
 }
 
-func TestRegisterTasks_Namespaced(t *testing.T) {
+func TestBuildToolSet_Namespaced(t *testing.T) {
 	s := loadServerFromFixture(t, "namespaced")
 
-	reg := &fakeRegistrar{}
-	if err := s.registerTasks(reg); err != nil {
-		t.Fatalf("registerTasks failed: %v", err)
-	}
-
-	names := make(map[string]bool)
-	for _, tool := range reg.tools {
-		names[tool.Name] = true
+	tools, _, err := s.buildToolSet()
+	if err != nil {
+		t.Fatalf("buildToolSet failed: %v", err)
 	}
 
 	for _, want := range []string{"db_migrate", "uv_run", "uv_run_dev_lint-imports"} {
-		if !names[want] {
-			t.Errorf("expected registered tool %q, got tools: %v", want, names)
+		if _, ok := tools[want]; !ok {
+			t.Errorf("expected tool %q, got tools: %v", want, toolNames(tools))
 		}
 	}
 }
 
-func TestRegisterTasks_Includes(t *testing.T) {
+func TestBuildToolSet_Includes(t *testing.T) {
 	s := loadServerFromFixture(t, "includes")
 
-	reg := &fakeRegistrar{}
-	if err := s.registerTasks(reg); err != nil {
-		t.Fatalf("registerTasks failed: %v", err)
-	}
-
-	names := make(map[string]bool)
-	for _, tool := range reg.tools {
-		names[tool.Name] = true
+	tools, _, err := s.buildToolSet()
+	if err != nil {
+		t.Fatalf("buildToolSet failed: %v", err)
 	}
 
 	for _, want := range []string{"build", "docs_serve", "docs_build"} {
-		if !names[want] {
-			t.Errorf("expected registered tool %q, got tools: %v", want, names)
+		if _, ok := tools[want]; !ok {
+			t.Errorf("expected tool %q, got tools: %v", want, toolNames(tools))
 		}
 	}
 }
 
-func TestRegisterTasks_Wildcard(t *testing.T) {
+func TestBuildToolSet_Wildcard(t *testing.T) {
 	s := loadServerFromFixture(t, "wildcard")
 
-	reg := &fakeRegistrar{}
-	if err := s.registerTasks(reg); err != nil {
-		t.Fatalf("registerTasks failed: %v", err)
-	}
-
-	names := make(map[string]bool)
-	for _, tool := range reg.tools {
-		names[tool.Name] = true
+	tools, _, err := s.buildToolSet()
+	if err != nil {
+		t.Fatalf("buildToolSet failed: %v", err)
 	}
 
 	for _, want := range []string{"start", "deploy"} {
-		if !names[want] {
-			t.Errorf("expected registered tool %q, got tools: %v", want, names)
+		if _, ok := tools[want]; !ok {
+			t.Errorf("expected tool %q, got tools: %v", want, toolNames(tools))
+		}
+	}
+}
+
+func TestToolsEqual(t *testing.T) {
+	schema1 := json.RawMessage(`{"type":"object","properties":{"FOO":{"type":"string"}}}`)
+	schema2 := json.RawMessage(`{"type":"object","properties":{"BAR":{"type":"string"}}}`)
+
+	tests := []struct {
+		name string
+		a, b *mcp.Tool
+		want bool
+	}{
+		{
+			name: "identical",
+			a:    &mcp.Tool{Name: "greet", Description: "Say hello", InputSchema: schema1},
+			b:    &mcp.Tool{Name: "greet", Description: "Say hello", InputSchema: schema1},
+			want: true,
+		},
+		{
+			name: "different name",
+			a:    &mcp.Tool{Name: "greet", Description: "Say hello", InputSchema: schema1},
+			b:    &mcp.Tool{Name: "build", Description: "Say hello", InputSchema: schema1},
+			want: false,
+		},
+		{
+			name: "different description",
+			a:    &mcp.Tool{Name: "greet", Description: "Say hello", InputSchema: schema1},
+			b:    &mcp.Tool{Name: "greet", Description: "Say goodbye", InputSchema: schema1},
+			want: false,
+		},
+		{
+			name: "different schema",
+			a:    &mcp.Tool{Name: "greet", Description: "Say hello", InputSchema: schema1},
+			b:    &mcp.Tool{Name: "greet", Description: "Say hello", InputSchema: schema2},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := toolsEqual(tt.a, tt.b)
+			if got != tt.want {
+				t.Errorf("toolsEqual() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSyncTools_Idempotent(t *testing.T) {
+	s := newTestServer(t, "basic")
+
+	if err := s.syncTools(); err != nil {
+		t.Fatalf("first syncTools failed: %v", err)
+	}
+	first := make(map[string]mcp.Tool)
+	maps.Copy(first, s.registeredTools)
+
+	if err := s.syncTools(); err != nil {
+		t.Fatalf("second syncTools failed: %v", err)
+	}
+
+	if len(s.registeredTools) != len(first) {
+		t.Errorf("tool count changed: %d -> %d", len(first), len(s.registeredTools))
+	}
+	for name, tool := range first {
+		cur, ok := s.registeredTools[name]
+		if !ok {
+			t.Errorf("tool %q disappeared after second sync", name)
+			continue
+		}
+		if !toolsEqual(&tool, &cur) {
+			t.Errorf("tool %q changed after second sync", name)
 		}
 	}
 }
@@ -356,6 +430,16 @@ func lookupTask(t *testing.T, tf *ast.Taskfile, name string) *ast.Task {
 
 	t.Fatalf("task %q not found in taskfile", name)
 	return nil
+}
+
+// toolNames returns the sorted keys from a tool map for use in error messages.
+func toolNames(tools map[string]mcp.Tool) []string {
+	names := make([]string, 0, len(tools))
+	for name := range tools {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
 }
 
 // schemaRequired extracts the "required" array from a tool's InputSchema.

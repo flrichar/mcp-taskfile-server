@@ -47,16 +47,13 @@ func countWildcards(taskName string) int {
 	return strings.Count(taskName, "*")
 }
 
-// toolRegistrar is an interface for registering MCP tools, satisfied by *mcp.Server.
-type toolRegistrar interface {
-	AddTool(t *mcp.Tool, h mcp.ToolHandler)
-}
-
 // TaskfileServer represents our MCP server for Taskfile.yml.
 type TaskfileServer struct {
-	executor *task.Executor
-	taskfile *ast.Taskfile
-	workdir  string
+	executor        *task.Executor
+	taskfile        *ast.Taskfile
+	workdir         string
+	mcpServer       *mcp.Server
+	registeredTools map[string]mcp.Tool
 }
 
 // NewTaskfileServer creates a new Taskfile MCP server.
@@ -267,29 +264,77 @@ func (s *TaskfileServer) createToolForTask(taskName string, taskDef *ast.Task) *
 	}
 }
 
-// registerTasks discovers all tasks and registers them as MCP tools.
-func (s *TaskfileServer) registerTasks(mcpServer toolRegistrar) error {
+// buildToolSet discovers all tasks and returns tool definitions and handlers
+// without registering them on a server.
+func (s *TaskfileServer) buildToolSet() (map[string]mcp.Tool, map[string]mcp.ToolHandler, error) {
 	if s.taskfile.Tasks == nil {
-		return errors.New("no tasks found in Taskfile")
+		return nil, nil, errors.New("no tasks found in Taskfile")
 	}
 
-	// Iterate through all tasks and register them
+	tools := make(map[string]mcp.Tool)
+	handlers := make(map[string]mcp.ToolHandler)
+
 	for taskName, taskDef := range s.taskfile.Tasks.All(nil) {
-		// Skip internal tasks
 		if taskDef.Internal {
 			continue
 		}
 
-		// Create tool definition
 		tool := s.createToolForTask(taskName, taskDef)
-
-		// Create handler
-		handler := s.createTaskHandler(taskName)
-
-		// Register with MCP server
-		mcpServer.AddTool(tool, handler)
+		tools[tool.Name] = *tool
+		handlers[tool.Name] = s.createTaskHandler(taskName)
 	}
 
+	return tools, handlers, nil
+}
+
+// toolsEqual reports whether two tool definitions are equivalent
+// by comparing Name, Description, and InputSchema bytes.
+func toolsEqual(a, b *mcp.Tool) bool {
+	if a.Name != b.Name || a.Description != b.Description {
+		return false
+	}
+	aSchema, err := json.Marshal(a.InputSchema)
+	if err != nil {
+		return false
+	}
+	bSchema, err := json.Marshal(b.InputSchema)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(aSchema, bSchema)
+}
+
+// syncTools builds the current tool set, diffs it against previously
+// registered tools, and adds/removes tools on the MCP server as needed.
+func (s *TaskfileServer) syncTools() error {
+	tools, handlers, err := s.buildToolSet()
+	if err != nil {
+		return err
+	}
+
+	// Remove tools that no longer exist or have changed
+	var stale []string
+	for name, old := range s.registeredTools {
+		if newTool, ok := tools[name]; !ok {
+			stale = append(stale, name)
+		} else if !toolsEqual(&old, &newTool) {
+			stale = append(stale, name)
+		}
+	}
+	if len(stale) > 0 {
+		s.mcpServer.RemoveTools(stale...)
+	}
+
+	// Add tools that are new or were removed above due to changes
+	for name, tool := range tools {
+		if old, ok := s.registeredTools[name]; ok && toolsEqual(&old, &tool) {
+			continue
+		}
+		t := tool
+		s.mcpServer.AddTool(&t, handlers[name])
+	}
+
+	s.registeredTools = tools
 	return nil
 }
 
@@ -309,9 +354,11 @@ func main() {
 		},
 		nil,
 	)
+	taskfileServer.mcpServer = mcpServer
+	taskfileServer.registeredTools = make(map[string]mcp.Tool)
 
 	// Register all tasks as MCP tools
-	if err := taskfileServer.registerTasks(mcpServer); err != nil {
+	if err := taskfileServer.syncTools(); err != nil {
 		fmt.Printf("Failed to register tasks: %v\n", err)
 		os.Exit(1)
 	}
