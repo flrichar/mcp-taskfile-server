@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"log"
 	"maps"
 	"net/url"
@@ -70,6 +69,8 @@ type rootState struct {
 	taskfile        *ast.Taskfile
 	workdir         string
 	registeredTools []string
+	watchDirs       []string
+	watchTaskfiles  map[string]struct{}
 	watcher         *fsnotify.Watcher
 }
 
@@ -119,10 +120,15 @@ func sanitizeRootPrefix(name string) string {
 }
 
 // loadRoot creates a new rootState by loading the Taskfile from the given directory.
-func loadRoot(dir string) (*rootState, error) {
+func loadRoot(ctx context.Context, dir string) (*rootState, error) {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve path: %w", err)
+	}
+
+	watchTaskfiles, watchDirs, err := loadTaskfileWatchSet(ctx, abs)
+	if err != nil {
+		return nil, err
 	}
 
 	executor := task.NewExecutor(
@@ -135,10 +141,96 @@ func loadRoot(dir string) (*rootState, error) {
 	}
 
 	return &rootState{
-		executor: executor,
-		taskfile: executor.Taskfile,
-		workdir:  abs,
+		executor:       executor,
+		taskfile:       executor.Taskfile,
+		workdir:        abs,
+		watchDirs:      watchDirs,
+		watchTaskfiles: watchTaskfiles,
 	}, nil
+}
+
+// loadTaskfileWatchSet reads the resolved Taskfile graph for a root and returns
+// the local Taskfile files and parent directories that should be watched.
+func loadTaskfileWatchSet(ctx context.Context, dir string) (map[string]struct{}, []string, error) {
+	rootNode, err := taskfile.NewRootNode("", dir, false, 0)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to resolve root Taskfile for %s: %w", dir, err)
+	}
+
+	graph, err := taskfile.NewReader().Read(ctx, rootNode)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read Taskfile graph for %s: %w", dir, err)
+	}
+
+	adjacencyMap, err := graph.AdjacencyMap()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to inspect Taskfile graph for %s: %w", dir, err)
+	}
+
+	watchTaskfiles := make(map[string]struct{}, len(adjacencyMap))
+	watchDirs := make(map[string]struct{}, len(adjacencyMap))
+	for location := range adjacencyMap {
+		path, ok, err := taskfileLocationToPath(location)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !ok {
+			continue
+		}
+		watchTaskfiles[path] = struct{}{}
+		watchDirs[filepath.Dir(path)] = struct{}{}
+	}
+
+	return watchTaskfiles, sortedKeys(watchDirs), nil
+}
+
+// taskfileLocationToPath normalizes a Taskfile graph vertex location into a
+// local filesystem path. Non-local taskfiles are ignored.
+func taskfileLocationToPath(location string) (string, bool, error) {
+	if filepath.IsAbs(location) {
+		return filepath.Clean(location), true, nil
+	}
+
+	u, err := url.Parse(location)
+	if err != nil {
+		return "", false, fmt.Errorf("invalid Taskfile location %q: %w", location, err)
+	}
+	if u.Scheme == "" {
+		path, absErr := filepath.Abs(location)
+		if absErr != nil {
+			return "", false, fmt.Errorf("failed to resolve Taskfile path %q: %w", location, absErr)
+		}
+		return filepath.Clean(path), true, nil
+	}
+	if u.Scheme != "file" {
+		return "", false, nil
+	}
+
+	return filepath.Clean(filepath.FromSlash(u.Path)), true, nil
+}
+
+// sortedKeys returns the sorted keys of a string set.
+func sortedKeys(values map[string]struct{}) []string {
+	keys := make([]string, 0, len(values))
+	for value := range values {
+		keys = append(keys, value)
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+// cloneStringSet returns a shallow copy of a string set.
+func cloneStringSet(values map[string]struct{}) map[string]struct{} {
+	cloned := make(map[string]struct{}, len(values))
+	for value := range values {
+		cloned[value] = struct{}{}
+	}
+	return cloned
+}
+
+// cloneStrings returns a copy of a string slice.
+func cloneStrings(values []string) []string {
+	return append([]string(nil), values...)
 }
 
 // unloadRoot removes and cleans up the root with the given URI.
@@ -461,13 +553,18 @@ func isTaskfile(path string) bool {
 
 // reloadRoot re-creates the task executor for a given root URI and syncs
 // the global MCP tool set.
-func (s *TaskfileServer) reloadRoot(uri string) error {
+func (s *TaskfileServer) reloadRoot(ctx context.Context, uri string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	root, ok := s.roots[uri]
 	if !ok {
 		return fmt.Errorf("unknown root %q", uri)
+	}
+
+	watchTaskfiles, watchDirs, err := loadTaskfileWatchSet(ctx, root.workdir)
+	if err != nil {
+		return err
 	}
 
 	executor := task.NewExecutor(
@@ -479,6 +576,8 @@ func (s *TaskfileServer) reloadRoot(uri string) error {
 	}
 	root.executor = executor
 	root.taskfile = executor.Taskfile
+	root.watchDirs = watchDirs
+	root.watchTaskfiles = watchTaskfiles
 	return s.syncTools()
 }
 
@@ -487,13 +586,44 @@ func (s *TaskfileServer) reloadRoot(uri string) error {
 // wrapper for the single-root case.
 func (s *TaskfileServer) loadAndRegisterTools() error {
 	for uri := range s.roots {
-		return s.reloadRoot(uri)
+		return s.reloadRoot(context.Background(), uri)
 	}
 	return errors.New("no roots configured")
 }
 
-// watchRootTaskfiles watches a single root's directory tree for Taskfile
-// changes and reloads tools when a relevant file is modified.
+// rootWatchState returns copies of the current watch configuration for a root.
+func (s *TaskfileServer) rootWatchState(root *rootState) ([]string, map[string]struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return cloneStrings(root.watchDirs), cloneStringSet(root.watchTaskfiles)
+}
+
+// syncWatcherDirs ensures the fsnotify watcher is subscribed to the provided
+// directories and unsubscribed from any directories no longer needed.
+func syncWatcherDirs(watcher *fsnotify.Watcher, current map[string]struct{}, desired []string) (map[string]struct{}, error) {
+	desiredSet := make(map[string]struct{}, len(desired))
+	for _, dir := range desired {
+		desiredSet[dir] = struct{}{}
+		if _, ok := current[dir]; ok {
+			continue
+		}
+		if err := watcher.Add(dir); err != nil {
+			return current, fmt.Errorf("watch %s: %w", dir, err)
+		}
+	}
+
+	for dir := range current {
+		if _, ok := desiredSet[dir]; ok {
+			continue
+		}
+		_ = watcher.Remove(dir)
+	}
+
+	return desiredSet, nil
+}
+
+// watchRootTaskfiles watches a single root's resolved Taskfile graph for
+// changes and reloads tools when one of those files is modified.
 func (s *TaskfileServer) watchRootTaskfiles(ctx context.Context, uri string, root *rootState) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -513,24 +643,14 @@ func (s *TaskfileServer) watchRootTaskfiles(ctx context.Context, uri string, roo
 		s.mu.Unlock()
 	}()
 
-	// Recursively add all directories under the root's workdir.
-	err = filepath.WalkDir(root.workdir, func(path string, d fs.DirEntry, err error) error {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			return watcher.Add(path)
-		}
-		return nil
-	})
+	watchDirs, watchTaskfiles := s.rootWatchState(root)
+	currentWatchDirs := make(map[string]struct{}, len(watchDirs))
+	currentWatchDirs, err = syncWatcherDirs(watcher, currentWatchDirs, watchDirs)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil
 		}
-		return fmt.Errorf("failed to walk working directory: %w", err)
+		return fmt.Errorf("failed to watch Taskfile directories: %w", err)
 	}
 
 	const debounce = 200 * time.Millisecond
@@ -549,22 +669,26 @@ func (s *TaskfileServer) watchRootTaskfiles(ctx context.Context, uri string, roo
 			return nil
 		case <-timer.C:
 			timerPending = false
-			if err := s.reloadRoot(uri); err != nil {
+			if err := s.reloadRoot(ctx, uri); err != nil {
 				log.Printf("failed to reload tools for root %s: %v", uri, err)
+				continue
+			}
+
+			watchDirs, watchTaskfiles = s.rootWatchState(root)
+			currentWatchDirs, err = syncWatcherDirs(watcher, currentWatchDirs, watchDirs)
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return fmt.Errorf("failed to refresh Taskfile watches for root %s: %w", uri, err)
 			}
 		case event, ok := <-watcher.Events:
 			if !ok {
 				return nil
 			}
 
-			// Watch for new directories so we stay recursive.
-			if event.Has(fsnotify.Create) {
-				if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
-					_ = watcher.Add(event.Name)
-				}
-			}
-
-			if !isTaskfile(event.Name) {
+			eventPath := filepath.Clean(event.Name)
+			if _, ok := watchTaskfiles[eventPath]; !ok {
 				continue
 			}
 
@@ -678,7 +802,7 @@ func (s *TaskfileServer) loadRootsFromSession(ctx context.Context, session *mcp.
 			return fmt.Errorf("failed to get working directory: %w", wdErr)
 		}
 		uri := dirToURI(workdir)
-		root, loadErr := loadRoot(workdir)
+		root, loadErr := loadRoot(ctx, workdir)
 		if loadErr != nil {
 			return loadErr
 		}
@@ -699,7 +823,7 @@ func (s *TaskfileServer) loadRootsFromSession(ctx context.Context, session *mcp.
 			log.Printf("skipping root with invalid URI %q: %v", r.URI, parseErr)
 			continue
 		}
-		root, loadErr := loadRoot(dir)
+		root, loadErr := loadRoot(ctx, dir)
 		if loadErr != nil {
 			log.Printf("failed to load root %q: %v", r.URI, loadErr)
 			continue
@@ -759,7 +883,7 @@ func (s *TaskfileServer) handleRootsChanged(ctx context.Context, req *mcp.RootsL
 			log.Printf("skipping root with invalid URI %q: %v", r.URI, parseErr)
 			continue
 		}
-		root, loadErr := loadRoot(dir)
+		root, loadErr := loadRoot(ctx, dir)
 		if loadErr != nil {
 			log.Printf("failed to load root %q: %v", r.URI, loadErr)
 			continue

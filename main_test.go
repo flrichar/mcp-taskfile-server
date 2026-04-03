@@ -26,7 +26,7 @@ func loadServerFromFixture(t *testing.T, name string) *TaskfileServer {
 	_, filename, _, _ := runtime.Caller(0)
 	dir := filepath.Join(filepath.Dir(filename), "testdata", name)
 
-	root, err := loadRoot(dir)
+	root, err := loadRoot(t.Context(), dir)
 	if err != nil {
 		t.Fatalf("failed to load root for fixture %q: %v", name, err)
 	}
@@ -565,7 +565,7 @@ func TestMultiRoot_Prefixing(t *testing.T) {
 	// Load a second root from a different fixture.
 	_, filename, _, _ := runtime.Caller(0)
 	dir2 := filepath.Join(filepath.Dir(filename), "testdata", "no-desc")
-	root2, err := loadRoot(dir2)
+	root2, err := loadRoot(t.Context(), dir2)
 	if err != nil {
 		t.Fatalf("loadRoot: %v", err)
 	}
@@ -615,6 +615,40 @@ func TestLoadAndRegisterTools(t *testing.T) {
 	}
 }
 
+func TestLoadRoot_WatchTaskfilesIncludesTransitive(t *testing.T) {
+	dir := t.TempDir()
+	deepDir := filepath.Join(dir, "sub", "deep")
+	if err := os.MkdirAll(deepDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "Taskfile.yml"), []byte("version: '3'\nincludes:\n  sub:\n    taskfile: ./sub\ntasks:\n  root:\n    cmds:\n      - echo root\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sub", "Taskfile.yml"), []byte("version: '3'\nincludes:\n  deep:\n    taskfile: ./deep\ntasks:\n  child:\n    cmds:\n      - echo child\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(deepDir, "Taskfile.yml"), []byte("version: '3'\ntasks:\n  leaf:\n    cmds:\n      - echo leaf\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	root, err := loadRoot(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("loadRoot: %v", err)
+	}
+
+	want := []string{
+		filepath.Join(dir, "Taskfile.yml"),
+		filepath.Join(dir, "sub", "Taskfile.yml"),
+		filepath.Join(deepDir, "Taskfile.yml"),
+	}
+
+	got := sortedKeys(root.watchTaskfiles)
+	if !slices.Equal(got, want) {
+		t.Fatalf("watchTaskfiles = %v, want %v", got, want)
+	}
+}
+
 func TestWatchTaskfiles_ReloadsOnChange(t *testing.T) {
 	// Create a temp directory with a minimal Taskfile.
 	dir := t.TempDir()
@@ -658,6 +692,149 @@ func TestWatchTaskfiles_ReloadsOnChange(t *testing.T) {
 			s.mu.Unlock()
 			if ok {
 				return // success
+			}
+		}
+	}
+}
+
+func TestWatchTaskfiles_IgnoresUnincludedChildTaskfile(t *testing.T) {
+	dir := t.TempDir()
+	childDir := filepath.Join(dir, "child")
+	if err := os.Mkdir(childDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "Taskfile.yml"), []byte("version: '3'\ntasks:\n  hello:\n    desc: Root task\n    cmds:\n      - echo hello\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(childDir, "Taskfile.yml"), []byte("version: '3'\ntasks:\n  child:\n    desc: Child task\n    cmds:\n      - echo child\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := newServerForDir(t, dir)
+	root := onlyRoot(t, s)
+	if _, ok := root.watchTaskfiles[filepath.Join(childDir, "Taskfile.yml")]; ok {
+		t.Fatal("unexpected watch on unincluded child Taskfile")
+	}
+
+	initialTaskfile := root.taskfile
+	ctx := t.Context()
+
+	go func() {
+		_ = s.watchTaskfiles(ctx, snapshotRoots(s))
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	if err := os.WriteFile(filepath.Join(childDir, "Taskfile.yml"), []byte("version: '3'\ntasks:\n  child:\n    desc: Updated child task\n    cmds:\n      - echo child\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(400 * time.Millisecond)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if onlyRoot(t, s).taskfile != initialTaskfile {
+		t.Fatal("editing an unincluded child Taskfile unexpectedly reloaded the root")
+	}
+}
+
+func TestWatchTaskfiles_ReloadsOnIncludedTaskfileChange(t *testing.T) {
+	dir := t.TempDir()
+	childDir := filepath.Join(dir, "sub")
+	if err := os.Mkdir(childDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "Taskfile.yml"), []byte("version: '3'\nincludes:\n  sub:\n    taskfile: ./sub\ntasks:\n  hello:\n    desc: Root task\n    cmds:\n      - echo hello\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(childDir, "Taskfile.yml"), []byte("version: '3'\ntasks:\n  child:\n    desc: First child description\n    cmds:\n      - echo child\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := newServerForDir(t, dir)
+	ctx := t.Context()
+
+	go func() {
+		_ = s.watchTaskfiles(ctx, snapshotRoots(s))
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	if err := os.WriteFile(filepath.Join(childDir, "Taskfile.yml"), []byte("version: '3'\ntasks:\n  child:\n    desc: Updated child description\n    cmds:\n      - echo child\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.After(2 * time.Second)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-deadline:
+			s.mu.Lock()
+			tool := s.registeredTools["sub_child"]
+			s.mu.Unlock()
+			t.Fatalf("timed out waiting for included Taskfile reload; last tool state: %+v", tool)
+		case <-ticker.C:
+			s.mu.Lock()
+			tool, ok := s.registeredTools["sub_child"]
+			s.mu.Unlock()
+			if ok && strings.Contains(tool.Description, "Updated child description") {
+				return
+			}
+		}
+	}
+}
+
+func TestWatchTaskfiles_ReloadsOnTransitiveIncludedTaskfileChange(t *testing.T) {
+	dir := t.TempDir()
+	deepDir := filepath.Join(dir, "sub", "deep")
+	if err := os.MkdirAll(deepDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "Taskfile.yml"), []byte("version: '3'\nincludes:\n  sub:\n    taskfile: ./sub\ntasks:\n  hello:\n    desc: Root task\n    cmds:\n      - echo hello\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sub", "Taskfile.yml"), []byte("version: '3'\nincludes:\n  deep:\n    taskfile: ./deep\ntasks:\n  child:\n    desc: Child task\n    cmds:\n      - echo child\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(deepDir, "Taskfile.yml"), []byte("version: '3'\ntasks:\n  leaf:\n    desc: First deep description\n    cmds:\n      - echo leaf\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := newServerForDir(t, dir)
+	ctx := t.Context()
+
+	go func() {
+		_ = s.watchTaskfiles(ctx, snapshotRoots(s))
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	if err := os.WriteFile(filepath.Join(deepDir, "Taskfile.yml"), []byte("version: '3'\ntasks:\n  leaf:\n    desc: Updated deep description\n    cmds:\n      - echo leaf\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.After(2 * time.Second)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-deadline:
+			s.mu.Lock()
+			tool := s.registeredTools["sub_deep_leaf"]
+			s.mu.Unlock()
+			t.Fatalf("timed out waiting for transitive include reload; last tool state: %+v", tool)
+		case <-ticker.C:
+			s.mu.Lock()
+			tool, ok := s.registeredTools["sub_deep_leaf"]
+			s.mu.Unlock()
+			if ok && strings.Contains(tool.Description, "Updated deep description") {
+				return
 			}
 		}
 	}
@@ -749,7 +926,7 @@ func newTempServer(t *testing.T, taskfileContent []byte) *TaskfileServer {
 // with a real *mcp.Server and initial syncTools.
 func newServerForDir(t *testing.T, dir string) *TaskfileServer {
 	t.Helper()
-	root, err := loadRoot(dir)
+	root, err := loadRoot(t.Context(), dir)
 	if err != nil {
 		t.Fatalf("loadRoot: %v", err)
 	}
@@ -1129,7 +1306,7 @@ func TestCreateTaskHandler_TaskFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	root, err := loadRoot(dir)
+	root, err := loadRoot(t.Context(), dir)
 	if err != nil {
 		t.Fatalf("loadRoot: %v", err)
 	}
@@ -1157,7 +1334,7 @@ func TestCreateTaskHandler_WithVariables(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	root, err := loadRoot(dir)
+	root, err := loadRoot(t.Context(), dir)
 	if err != nil {
 		t.Fatalf("loadRoot: %v", err)
 	}
@@ -1301,11 +1478,11 @@ func TestBuildToolSet_Collision(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r1, err := loadRoot(dir1)
+	r1, err := loadRoot(t.Context(), dir1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	r2, err := loadRoot(dir2)
+	r2, err := loadRoot(t.Context(), dir2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1332,7 +1509,7 @@ func TestBuildToolSet_NoTasks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	root, err := loadRoot(dir)
+	root, err := loadRoot(t.Context(), dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1421,7 +1598,7 @@ func TestHandleRootsChanged_TransitionToUnprefixed(t *testing.T) {
 func TestReloadRoot_UnknownURI(t *testing.T) {
 	s := newTestServer(t, "basic")
 
-	err := s.reloadRoot("file:///nonexistent")
+	err := s.reloadRoot(t.Context(), "file:///nonexistent")
 	if err == nil {
 		t.Fatal("expected error for unknown URI, got nil")
 	}
@@ -1465,12 +1642,13 @@ func TestWatchTaskfiles_NewSubdirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Give the watcher time to pick up the new directory.
+	// The new subdirectory is not watched yet because it isn't part of the
+	// resolved include graph. The root Taskfile edit below should trigger a
+	// reload, which then adds the new include path to the watch set.
 	time.Sleep(200 * time.Millisecond)
 
-	// Write a Taskfile in the new subdirectory. The main Taskfile includes it
-	// indirectly — but we're testing that the watcher picks up the file event
-	// in the new subdirectory. Update the root Taskfile to include it.
+	// Write a Taskfile in the new subdirectory, then update the root Taskfile to
+	// include it.
 	subTaskfile := []byte("version: '3'\ntasks:\n  sub-task:\n    desc: From subdirectory\n    cmds:\n      - echo sub\n")
 	if err := os.WriteFile(filepath.Join(subdir, "Taskfile.yml"), subTaskfile, 0o600); err != nil {
 		t.Fatal(err)
