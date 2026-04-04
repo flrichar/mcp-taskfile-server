@@ -1,29 +1,25 @@
-package main
+package taskfileserver
 
 import (
 	"context"
 	"sync"
 
-	"github.com/fsnotify/fsnotify"
-	"github.com/go-task/task/v3"
 	"github.com/go-task/task/v3/taskfile/ast"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// rootState holds the per-root task executor state.
-type rootState struct {
-	executor        *task.Executor
+// Root holds the loaded per-root Taskfile data.
+type Root struct {
 	taskfile        *ast.Taskfile
 	workdir         string
 	registeredTools []string
 	watchDirs       []string
 	watchTaskfiles  map[string]struct{}
-	watcher         *fsnotify.Watcher
 }
 
-// TaskfileServer represents our MCP server for Taskfile.yml.
-type TaskfileServer struct {
-	roots           map[string]*rootState
+// Server represents our MCP server for Taskfile.yml.
+type Server struct {
+	roots           map[string]*Root
 	mcpServer       *mcp.Server
 	registeredTools map[string]mcp.Tool
 	mu              sync.Mutex
@@ -31,11 +27,10 @@ type TaskfileServer struct {
 	watchDone       chan struct{}
 }
 
-// rootSnapshot is a URI→rootState pair captured under lock for use by
-// watchTaskfiles without holding the mutex.
+// rootSnapshot is a root URI captured under lock for use by watchTaskfiles
+// without holding the mutex.
 type rootSnapshot struct {
-	uri  string
-	root *rootState
+	uri string
 }
 
 // cloneStringSet returns a shallow copy of a string set.
