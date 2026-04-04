@@ -4,6 +4,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,10 +35,18 @@ var (
 	serverVersion = "dev"
 )
 
-// sanitizeToolName converts a Taskfile task name into a valid MCP tool name.
-// It replaces colons with underscores and strips wildcard (*) segments.
-// The returned name conforms to the MCP spec: [a-zA-Z0-9_.-]{1,128}.
+const maxToolNameLength = 128
+
+// invalidToolNameChars matches characters not recommended by the MCP tool name spec.
+var invalidToolNameChars = regexp.MustCompile(`[^a-zA-Z0-9_.\-]`)
+
+// sanitizeToolName converts a candidate tool name into an MCP-valid name.
+// It preserves Task namespace semantics by replacing colons with underscores,
+// strips wildcard (*) segments, replaces any remaining unsupported characters
+// with underscores, and caps the final name at the MCP-recommended length.
 func sanitizeToolName(taskName string) string {
+	original := taskName
+
 	// Replace colons with underscores
 	name := strings.ReplaceAll(taskName, ":", "_")
 
@@ -51,7 +61,25 @@ func sanitizeToolName(taskName string) string {
 	// Trim trailing underscores left after stripping wildcards
 	name = strings.TrimRight(name, "_")
 
+	// Replace any remaining unsupported characters.
+	name = invalidToolNameChars.ReplaceAllString(name, "_")
+
+	if name == "" {
+		name = "task_" + shortToolNameHash(original)
+	}
+
+	if len(name) > maxToolNameLength {
+		suffix := "_" + shortToolNameHash(original)
+		keep := max(1, maxToolNameLength-len(suffix))
+		name = name[:keep] + suffix
+	}
+
 	return name
+}
+
+func shortToolNameHash(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])[:8]
 }
 
 // isWildcardTask returns true if the task name contains wildcard segments.
@@ -138,13 +166,10 @@ func isWindowsDriveURIPath(path string) bool {
 	return (drive >= 'a' && drive <= 'z') || (drive >= 'A' && drive <= 'Z')
 }
 
-// validRootPrefixChars matches characters NOT allowed in a root prefix.
-var validRootPrefixChars = regexp.MustCompile(`[^a-zA-Z0-9_.\-]`)
-
 // sanitizeRootPrefix converts a root name or directory basename into a valid
 // MCP tool name prefix component.
 func sanitizeRootPrefix(name string) string {
-	s := validRootPrefixChars.ReplaceAllString(name, "_")
+	s := invalidToolNameChars.ReplaceAllString(name, "_")
 	s = strings.Trim(s, "_")
 	if s == "" {
 		return "root"
@@ -420,7 +445,7 @@ func createTaskHandler(root *rootState, taskName string) mcp.ToolHandler {
 // references the original Taskfile task name for clarity. The prefix
 // parameter is used in multi-root mode to namespace tool names.
 func createToolForTask(root *rootState, prefix, taskName string, taskDef *ast.Task) *mcp.Tool {
-	toolName := prefixedToolName(prefix, sanitizeToolName(taskName))
+	toolName := sanitizeToolName(prefixedToolName(prefix, taskName))
 
 	description := taskDef.Desc
 	if description == "" {
@@ -495,9 +520,17 @@ func createToolForTask(root *rootState, prefix, taskName string, taskDef *ast.Ta
 // buildToolSet discovers all tasks across all roots and returns tool definitions
 // and handlers without registering them on a server. It also populates each
 // root's registeredTools list.
-func (s *TaskfileServer) buildToolSet() (map[string]mcp.Tool, map[string]mcp.ToolHandler, error) {
+func (s *TaskfileServer) buildToolSet() (map[string]mcp.Tool, map[string]mcp.ToolHandler) {
+	type toolCandidate struct {
+		root     *rootState
+		taskName string
+		tool     mcp.Tool
+		handler  mcp.ToolHandler
+	}
+
 	tools := make(map[string]mcp.Tool)
 	handlers := make(map[string]mcp.ToolHandler)
+	candidates := make(map[string][]toolCandidate)
 
 	for _, root := range s.roots {
 		root.registeredTools = nil
@@ -516,16 +549,40 @@ func (s *TaskfileServer) buildToolSet() (map[string]mcp.Tool, map[string]mcp.Too
 			}
 
 			tool := createToolForTask(root, prefix, taskName, taskDef)
-			if _, exists := tools[tool.Name]; exists {
-				return nil, nil, fmt.Errorf("tool name collision: %q", tool.Name)
-			}
-			tools[tool.Name] = *tool
-			handlers[tool.Name] = createTaskHandler(root, taskName)
-			root.registeredTools = append(root.registeredTools, tool.Name)
+			candidates[tool.Name] = append(candidates[tool.Name], toolCandidate{
+				root:     root,
+				taskName: taskName,
+				tool:     *tool,
+				handler:  createTaskHandler(root, taskName),
+			})
 		}
 	}
 
-	return tools, handlers, nil
+	names := make([]string, 0, len(candidates))
+	for name := range candidates {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+
+	for _, name := range names {
+		group := candidates[name]
+		if len(group) > 1 {
+			details := make([]string, 0, len(group))
+			for _, candidate := range group {
+				details = append(details, fmt.Sprintf("%s (%s)", candidate.taskName, candidate.root.workdir))
+			}
+			slices.Sort(details)
+			log.Printf("excluding colliding tool name %q from MCP exposure: %s", name, strings.Join(details, ", "))
+			continue
+		}
+
+		candidate := group[0]
+		tools[name] = candidate.tool
+		handlers[name] = candidate.handler
+		candidate.root.registeredTools = append(candidate.root.registeredTools, name)
+	}
+
+	return tools, handlers
 }
 
 // toolsEqual reports whether two tool definitions are equivalent
@@ -548,10 +605,7 @@ func toolsEqual(a, b *mcp.Tool) bool {
 // syncTools builds the current tool set, diffs it against previously
 // registered tools, and adds/removes tools on the MCP server as needed.
 func (s *TaskfileServer) syncTools() error {
-	tools, handlers, err := s.buildToolSet()
-	if err != nil {
-		return err
-	}
+	tools, handlers := s.buildToolSet()
 
 	// Remove tools that no longer exist or have changed
 	var stale []string
