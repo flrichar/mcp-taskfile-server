@@ -22,6 +22,7 @@ func New() *Server {
 // SetMCPServer attaches the live MCP server instance used for tool updates.
 func (s *Server) SetMCPServer(server *mcp.Server) {
 	s.mcpServer = server
+	s.toolRegistry = server
 }
 
 // isMethodNotFound reports whether err is a JSON-RPC "method not found" error,
@@ -71,10 +72,12 @@ func (s *Server) reconcileRoots(ctx context.Context, roots []*mcp.Root, opts roo
 	}
 
 	s.mu.Lock()
+	mutated := false
 	if opts.removeMissing {
 		for uri := range s.roots {
 			if _, ok := desiredURIs[uri]; !ok {
 				s.unloadRoot(uri)
+				mutated = true
 			}
 		}
 	}
@@ -83,14 +86,18 @@ func (s *Server) reconcileRoots(ctx context.Context, roots []*mcp.Root, opts roo
 			continue
 		}
 		s.roots[uri] = root
+		mutated = true
+	}
+	if mutated {
+		s.generation++
 	}
 	if opts.requireNonEmpty && len(s.roots) == 0 {
 		s.mu.Unlock()
 		return errors.New("no valid roots found")
 	}
+	s.mu.Unlock()
 
 	syncErr := s.syncTools()
-	s.mu.Unlock()
 	if syncErr == nil || opts.restartWatchersOnSyncErr {
 		s.restartWatchers(ctx)
 	}

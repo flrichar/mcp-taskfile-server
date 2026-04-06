@@ -2,6 +2,7 @@ package taskfileserver
 
 import (
 	"context"
+	"maps"
 	"sync"
 
 	"github.com/go-task/task/v3/taskfile/ast"
@@ -16,15 +17,41 @@ type Root struct {
 	watchTaskfiles map[string]struct{}
 }
 
+// toolRegistry is the subset of *mcp.Server used for tool registration.
+type toolRegistry interface {
+	AddTool(tool *mcp.Tool, handler mcp.ToolHandler)
+	RemoveTools(names ...string)
+}
+
 // Server represents our MCP server for Taskfile.yml.
 type Server struct {
 	roots           map[string]*Root
 	mcpServer       *mcp.Server
+	toolRegistry    toolRegistry
 	registeredTools map[string]mcp.Tool
 	mu              sync.Mutex
+	generation      uint64
 	watchCancel     context.CancelFunc
 	watchDone       chan struct{}
 	shuttingDown    bool
+}
+
+// toolStateSnapshot captures the inputs needed by buildToolPlan,
+// frozen at a specific generation.
+type toolStateSnapshot struct {
+	generation uint64
+	roots      map[string]*Root
+}
+
+// snapshotToolStateLocked returns a snapshot of the current tool-relevant
+// server state. The caller must hold s.mu.
+func (s *Server) snapshotToolStateLocked() toolStateSnapshot {
+	snap := toolStateSnapshot{
+		generation: s.generation,
+		roots:      make(map[string]*Root, len(s.roots)),
+	}
+	maps.Copy(snap.roots, s.roots)
+	return snap
 }
 
 // rootSnapshot is a canonical root URI captured under lock for use by

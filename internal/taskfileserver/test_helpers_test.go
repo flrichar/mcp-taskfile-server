@@ -2,10 +2,12 @@ package taskfileserver
 
 import (
 	"encoding/json"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -59,7 +61,9 @@ func onlyRootURI(t *testing.T, s *Server) string {
 func newTestServer(t *testing.T, fixture string) *Server {
 	t.Helper()
 	s := loadServerFromFixture(t, fixture)
-	s.mcpServer = mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0.0.0"}, nil)
+	mcpSrv := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0.0.0"}, nil)
+	s.mcpServer = mcpSrv
+	s.toolRegistry = mcpSrv
 	s.registeredTools = make(map[string]mcp.Tool)
 	return s
 }
@@ -107,6 +111,14 @@ func toolNames(tools map[string]mcp.Tool) []string {
 	return names
 }
 
+// snapshotFromServer builds a toolStateSnapshot from the server's current
+// roots without holding the mutex. Intended for tests only.
+func snapshotFromServer(s *Server) toolStateSnapshot {
+	snap := toolStateSnapshot{roots: make(map[string]*Root, len(s.roots))}
+	maps.Copy(snap.roots, s.roots)
+	return snap
+}
+
 // snapshotRoots returns a rootSnapshot slice for use with watchTaskfiles.
 func snapshotRoots(s *Server) []rootSnapshot {
 	snap := make([]rootSnapshot, 0, len(s.roots))
@@ -136,9 +148,11 @@ func newServerForDir(t *testing.T, dir string) *Server {
 		t.Fatalf("loadRoot: %v", err)
 	}
 	uri := dirToURI(dir)
+	mcpSrv := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0.0.0"}, nil)
 	s := &Server{
 		roots:           map[string]*Root{uri: root},
-		mcpServer:       mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0.0.0"}, nil),
+		mcpServer:       mcpSrv,
+		toolRegistry:    mcpSrv,
 		registeredTools: make(map[string]mcp.Tool),
 	}
 	if err := s.syncTools(); err != nil {
@@ -271,6 +285,45 @@ func waitForToolCount(t *testing.T, ts *Server, count int) {
 			}
 		}
 	}
+}
+
+// trackingRegistry wraps a toolRegistry and tracks the net set of tools
+// currently registered, providing an observable view of MCP-side state.
+type trackingRegistry struct {
+	inner toolRegistry
+	mu    sync.Mutex
+	tools map[string]struct{}
+}
+
+func newTrackingRegistry(inner toolRegistry) *trackingRegistry {
+	return &trackingRegistry{
+		inner: inner,
+		tools: make(map[string]struct{}),
+	}
+}
+
+func (r *trackingRegistry) AddTool(tool *mcp.Tool, handler mcp.ToolHandler) {
+	r.inner.AddTool(tool, handler)
+	r.mu.Lock()
+	r.tools[tool.Name] = struct{}{}
+	r.mu.Unlock()
+}
+
+func (r *trackingRegistry) RemoveTools(names ...string) {
+	r.inner.RemoveTools(names...)
+	r.mu.Lock()
+	for _, n := range names {
+		delete(r.tools, n)
+	}
+	r.mu.Unlock()
+}
+
+func (r *trackingRegistry) toolSet() map[string]struct{} {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	result := make(map[string]struct{}, len(r.tools))
+	maps.Copy(result, r.tools)
+	return result
 }
 
 // waitForRootCount waits until the server has exactly count loaded roots.

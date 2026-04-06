@@ -95,9 +95,9 @@ type toolPlan struct {
 	handlers map[string]mcp.ToolHandler
 }
 
-// buildToolPlan computes the desired tool registration state without mutating
-// the server or roots.
-func (s *Server) buildToolPlan() toolPlan {
+// buildToolPlan computes the desired tool registration state from a snapshot
+// without accessing or mutating the server.
+func buildToolPlan(snap toolStateSnapshot) toolPlan {
 	type toolCandidate struct {
 		root     *Root
 		taskName string
@@ -111,12 +111,12 @@ func (s *Server) buildToolPlan() toolPlan {
 	}
 	candidates := make(map[string][]toolCandidate)
 
-	for _, root := range s.roots {
+	for _, root := range snap.roots {
 		if root.taskfile == nil || root.taskfile.Tasks == nil {
 			continue
 		}
 
-		prefix := s.rootPrefix(root)
+		prefix := rootPrefix(root, len(snap.roots))
 
 		for taskName, taskDef := range root.taskfile.Tasks.All(nil) {
 			if taskDef.Internal {
@@ -176,33 +176,56 @@ func toolsEqual(a, b *mcp.Tool) bool {
 	return bytes.Equal(aSchema, bSchema)
 }
 
-// syncTools builds the current tool set, diffs it against previously
-// registered tools, and adds/removes tools on the MCP server as needed.
-func (s *Server) syncTools() error {
-	plan := s.buildToolPlan()
-
-	// Remove tools that no longer exist or have changed
-	var stale []string
-	for name, old := range s.registeredTools {
-		if newTool, ok := plan.tools[name]; !ok {
+// diffTools compares the old registered tool set against the desired set and
+// returns the names of tools to remove and tools to add (or re-add due to changes).
+func diffTools(old, desired map[string]mcp.Tool) (stale, added []string) {
+	for name, oldTool := range old {
+		if newTool, ok := desired[name]; !ok {
 			stale = append(stale, name)
-		} else if !toolsEqual(&old, &newTool) {
+		} else if !toolsEqual(&oldTool, &newTool) {
 			stale = append(stale, name)
 		}
 	}
-	if len(stale) > 0 {
-		s.mcpServer.RemoveTools(stale...)
-	}
-
-	// Add tools that are new or were removed above due to changes
-	for name, tool := range plan.tools {
-		if old, ok := s.registeredTools[name]; ok && toolsEqual(&old, &tool) {
+	for name, newTool := range desired {
+		if oldTool, ok := old[name]; ok && toolsEqual(&oldTool, &newTool) {
 			continue
 		}
-		t := tool
-		s.mcpServer.AddTool(&t, plan.handlers[name])
+		added = append(added, name)
 	}
+	return stale, added
+}
 
+// syncTools snapshots state under lock, builds a plan without the lock,
+// then re-acquires the lock to validate the generation and apply changes.
+// If the generation has advanced while the lock was released (another
+// mutator ran concurrently), the stale plan is discarded without touching
+// the MCP server, because that mutator will produce its own sync.
+func (s *Server) syncTools() error {
+	// Phase 1: snapshot under lock.
+	s.mu.Lock()
+	snap := s.snapshotToolStateLocked()
+	oldTools := make(map[string]mcp.Tool, len(s.registeredTools))
+	maps.Copy(oldTools, s.registeredTools)
+	s.mu.Unlock()
+
+	// Phase 2: pure planning — no lock held.
+	plan := buildToolPlan(snap)
+	stale, added := diffTools(oldTools, plan.tools)
+
+	// Phase 3: validate generation, apply MCP side effects, and commit
+	// bookkeeping — all under lock to prevent orphaned registrations.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.generation != snap.generation {
+		return nil
+	}
+	if len(stale) > 0 {
+		s.toolRegistry.RemoveTools(stale...)
+	}
+	for _, name := range added {
+		t := plan.tools[name]
+		s.toolRegistry.AddTool(&t, plan.handlers[name])
+	}
 	s.registeredTools = plan.tools
 	return nil
 }
