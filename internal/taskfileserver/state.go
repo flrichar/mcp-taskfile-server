@@ -8,7 +8,11 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// Root holds the loaded per-root Taskfile data.
+// Root holds the loaded per-root Taskfile data. Once a *Root is published
+// into Server.roots its fields are treated as read-only; mutations are
+// performed by replacing the pointer in the map rather than writing
+// through the existing value, so concurrent readers (snapshots, watchers)
+// always observe a consistent state.
 type Root struct {
 	taskfile       *ast.Taskfile
 	workdir        string
@@ -26,7 +30,7 @@ type toolRegistry interface {
 type Server struct {
 	roots           map[string]*Root
 	toolRegistry    toolRegistry
-	registeredTools map[string]mcp.Tool
+	registeredTools map[string]registeredTool
 	mu              sync.Mutex
 	generation      uint64
 	watchCancel     context.CancelFunc
@@ -65,18 +69,4 @@ func (s *Server) snapshotToolStateLocked() toolStateSnapshot {
 		}
 	}
 	return snap
-}
-
-// cloneStringSet returns a shallow copy of a string set.
-func cloneStringSet(values map[string]struct{}) map[string]struct{} {
-	cloned := make(map[string]struct{}, len(values))
-	for value := range values {
-		cloned[value] = struct{}{}
-	}
-	return cloned
-}
-
-// cloneStrings returns a copy of a string slice.
-func cloneStrings(values []string) []string {
-	return append([]string(nil), values...)
 }
